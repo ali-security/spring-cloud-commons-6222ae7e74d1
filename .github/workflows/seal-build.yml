@@ -1,0 +1,122 @@
+# Sealed build of spring-cloud-context (spring-cloud-commons monorepo).
+# Upstream has no GitHub Actions CI; this mirrors its .circleci/config.yml build
+# (./mvnw clean install on JDK 8, -Dmaven.test.redirectTestOutputToFile=true),
+# using the toolchain recorded in the released jar's manifest
+# (Created-By: Apache Maven 3.5.0, Build-Jdk: 1.8.0_282).
+# Upstream's checkstyle and spring-javaformat validation stay on.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      _JAVA_OPTIONS: "-Xms1024m -Xmx2048m"
+      TERM: dumb
+      MODULES: spring-cloud-context,spring-cloud-context-integration-tests,spring-cloud-context-webflux-integration-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download AdoptOpenJDK 8u282
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/jdk8u282.tar.gz" \
+            https://github.com/AdoptOpenJDK/openjdk8-binaries/releases/download/jdk8u282-b08/OpenJDK8U-jdk_x64_linux_hotspot_8u282b08.tar.gz
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: jdkfile
+          jdkFile: ${{ runner.temp }}/jdk8u282.tar.gz
+          java-version: "8.0.282"
+          architecture: x64
+
+      - name: Install Maven 3.5.0
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/maven.tar.gz" \
+            https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.5.0/apache-maven-3.5.0-bin.tar.gz
+          tar -xzf "$RUNNER_TEMP/maven.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.5.0/bin" >> "$GITHUB_PATH"
+
+      - name: Drop repo.spring.io profile
+        # .mvn/maven.config enables -P spring (repo.spring.io repositories, no
+        # longer anonymously reachable); every dependency resolves from Central.
+        run: ": > .mvn/maven.config"
+
+      - name: Build
+        run: |
+          mvn -v
+          mvn -B -e -V -nsu -Dmaven.javadoc.skip=true -Dgpg.skip=true \
+            -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+            -pl "$MODULES" -am -DskipTests clean install
+          mkdir -p seal-out
+          cp spring-cloud-context/target/spring-cloud-context-2.2.7.RELEASE.jar seal-out/
+
+      - name: Test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B -e -nsu -Dmaven.javadoc.skip=true -Dgpg.skip=true \
+              -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+              -Dmaven.test.redirectTestOutputToFile=true \
+              -pl "$MODULES" -am -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false \
+              -Dsurefire.failIfNoSpecifiedTests=false test
+          else
+            mvn -B -e -nsu -Dmaven.javadoc.skip=true -Dgpg.skip=true \
+              -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn \
+              -Dmaven.test.redirectTestOutputToFile=true \
+              -pl "$MODULES" -am test
+          fi
+
+      - name: Test report (per-module totals and skipped tests with reasons)
+        if: always()
+        shell: python3 {0}
+        run: |
+          import glob, os, re, xml.etree.ElementTree as ET
+          totals = {}
+          skipped = []
+          for f in sorted(glob.glob("**/target/surefire-reports/TEST-*.xml", recursive=True)):
+              mod = f.split("/target/")[0]
+              root = ET.parse(f).getroot()
+              t = totals.setdefault(mod, [0, 0, 0, 0])
+              t[0] += int(root.get("tests", 0)); t[1] += int(root.get("failures", 0))
+              t[2] += int(root.get("errors", 0)); t[3] += int(root.get("skipped", 0))
+              for tc in root.iter("testcase"):
+                  s = tc.find("skipped")
+                  if s is None:
+                      continue
+                  cls, name = tc.get("classname", ""), tc.get("name", "")
+                  reason = (s.get("message") or "").strip()
+                  if not reason:
+                      src = glob.glob(f"{mod}/src/test/java/" + cls.replace(".", "/") + ".java")
+                      if src:
+                          lines = open(src[0], encoding="utf-8").read().splitlines()
+                          for i, l in enumerate(lines):
+                              if re.search(r"\bvoid\s+" + re.escape(name) + r"\s*\(", l):
+                                  ann = [x.strip() for x in lines[max(0, i - 4):i] if "@Ignore" in x or "@Disabled" in x]
+                                  reason = "source annotation: " + " | ".join(ann) if ann else ""
+                                  break
+                          if not reason:
+                              ann = [x.strip() for x in lines if x.strip().startswith(("@Ignore", "@Disabled"))]
+                              reason = "class-level annotation: " + " | ".join(ann) if ann else "no reason recorded"
+                  skipped.append(f"{mod}: {cls}.{name} -- {reason}")
+          print("=== Skipped tests ===")
+          for s in skipped:
+              print("SKIPPED", s)
+          print("=== Per-module test totals ===")
+          T = [0, 0, 0, 0]
+          for mod, (n, fl, er, sk) in totals.items():
+              print(f"{mod}: tests={n} failures={fl} errors={er} skipped={sk} passed={n - fl - er - sk}")
+              T = [a + b for a, b in zip(T, (n, fl, er, sk))]
+          print(f"TOTAL: tests={T[0]} failures={T[1]} errors={T[2]} skipped={T[3]} passed={T[0] - T[1] - T[2] - T[3]}")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spring-cloud-context-jar
+          path: seal-out/spring-cloud-context-2.2.7.RELEASE.jar
+          if-no-files-found: error
